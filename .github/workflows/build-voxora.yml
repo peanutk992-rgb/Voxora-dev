@@ -1,0 +1,156 @@
+# Voxora Launcher - build otomatis di GitHub
+# Versi modifikasi TIDAK RESMI dari Zalith Launcher 2 (GPL-3.0). Bukan produk resmi Minecraft.
+#
+# PASANG (3 langkah):
+#  1. Unggah file voxora-kit.zip ke halaman utama repository ini
+#     (Add file > Upload files > pilih voxora-kit.zip, JANGAN di-extract > Commit changes).
+#  2. Simpan isi file ini sebagai .github/workflows/build-voxora.yml
+#  3. Tab Actions > Build Voxora Launcher > Run workflow (arm64).
+#     Selesai (25-45 menit): halaman utama repository > Releases > ketuk file .apk > pasang.
+#
+# OPSIONAL (Settings > Secrets and variables > Actions): OAUTH_CLIENT_ID, CURSEFORGE_API_KEY
+
+name: Build Voxora Launcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Arsitektur HP (arm64 untuk hampir semua HP modern)"
+        type: choice
+        default: arm64
+        options: [arm64, arm, x86_64, x86, all]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    env:
+      ARCH: ${{ inputs.arch || 'arm64' }}
+      KIT_VERSION: "2026-10-28-a"
+      OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+      CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+
+    steps:
+      - name: Ambil kode sumber Zalith Launcher 2 (versi yang sudah diuji)
+        uses: actions/checkout@v6
+        with:
+          repository: ZalithLauncher/ZalithLauncher2
+          ref: bf1e2e9db9bfe6097c7981ae8997a79c3866dd06
+          submodules: recursive
+
+      - name: Ambil repository-mu (isinya voxora-kit.zip)
+        uses: actions/checkout@v6
+        with:
+          path: voxora-me
+
+      - name: Buka voxora-kit.zip
+        shell: bash
+        run: |
+          set -uo pipefail
+          FOUND=""
+          while IFS= read -r z; do
+            t="$RUNNER_TEMP/kit-try"
+            rm -rf "$t"; mkdir -p "$t"
+            if ! python3 -m zipfile -e "$z" "$t" > /dev/null 2>&1; then
+              echo "Dilewati (zip rusak): $z"; continue
+            fi
+            v="$(find "$t" -maxdepth 2 -name VERSION | head -n 1)"
+            if [ -n "$v" ] && [ "$(tr -d '[:space:]' < "$v")" = "$KIT_VERSION" ]; then
+              FOUND="$(dirname "$v")"; echo "Dipakai: $z"; break
+            fi
+            echo "Dilewati (versi beda): $z"
+          done < <(find voxora-me -maxdepth 4 -type f -iname 'voxora*.zip' -not -path '*/.git/*' | sort)
+          if [ -z "$FOUND" ]; then
+            echo "::error::voxora-kit.zip (versi $KIT_VERSION) tidak ketemu di repository-mu. Unggah file voxora-kit.zip ke halaman utama repository (Add file > Upload files > Commit changes), lalu jalankan workflow ini lagi."
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/voxora-kit"
+          cp -r "$FOUND" "$RUNNER_TEMP/voxora-kit"
+          if ! ( cd "$RUNNER_TEMP/voxora-kit" && sha256sum -c SHA256SUMS --quiet ); then
+            echo "::error::Isi voxora-kit.zip rusak atau tidak lengkap. Unduh ulang dari chat, lalu unggah lagi."
+            exit 1
+          fi
+          echo "KIT=$RUNNER_TEMP/voxora-kit" >> "$GITHUB_ENV"
+          find "$RUNNER_TEMP/voxora-kit" -type f | sort
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          add-job-summary: "on-failure"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            PetLib/rust/target
+          key: petlib-rust-${{ runner.os }}-${{ hashFiles('PetLib/rust/Cargo.lock') }}
+          restore-keys: petlib-rust-${{ runner.os }}-
+
+      - name: Install cargo-ndk
+        run: |
+          version="4.1.2"
+          curl -sL "https://github.com/bbqsrc/cargo-ndk/releases/download/v${version}/cargo-ndk-x86_64-unknown-linux-gnu-v${version}.tgz" |
+            tar xz -C "$HOME/.cargo/bin" --strip-components=1
+          chmod +x "$HOME/.cargo/bin"/cargo-ndk*
+          cargo ndk --version
+
+      - name: Setup Android NDK
+        run: |
+          ndk=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)
+          if [ -z "$ndk" ] || [ ! -f "$ndk/source.properties" ]; then
+            sdkmanager --install "ndk;27.0.12077973"
+            ndk=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          fi
+          echo "Using NDK at $ndk"
+          test -f "$ndk/source.properties"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+
+      - name: Bangun Voxora Launcher (otomatis pakai cadangan kalau ada yang gagal)
+        id: build
+        shell: bash
+        run: bash "$KIT/build.sh"
+
+      - name: Unggah APK
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Voxora-Launcher-${{ inputs.arch || 'arm64' }}
+          path: voxora-out/apk/*.apk
+          if-no-files-found: ignore
+
+      - name: Unggah log build
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Voxora-build-log
+          path: voxora-out/logs
+          if-no-files-found: ignore
+
+      - name: Terbitkan APK ke halaman Releases (bisa diunduh langsung, tanpa zip)
+        if: ${{ always() && steps.build.outputs.got == '1' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_NO: ${{ github.run_number }}
+          RUN_TRY: ${{ github.run_attempt }}
+          B_VARIANT: ${{ steps.build.outputs.variant }}
+          B_MODS: ${{ steps.build.outputs.mods }}
+        run: bash "$KIT/release.sh"
